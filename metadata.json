@@ -1,0 +1,6 @@
+{
+  "name": "Diet Site Generator",
+  "description": "Generates a single page website from a directory containing diet overview and groceries PDF files, with automatic sensitive data redaction.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
