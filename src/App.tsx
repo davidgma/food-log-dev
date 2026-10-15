@@ -1,116 +1,240 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React, { useState } from 'react';
-import { Play, CheckCircle, AlertCircle, FileBox } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Header } from './components/Header';
+import { OverviewSection } from './components/OverviewSection';
+import { FoodLogSection } from './components/FoodLogSection';
+import { AnalyticsSection } from './components/AnalyticsSection';
+import { GroceriesSection } from './components/GroceriesSection';
+import { DocumentModal } from './components/DocumentModal';
+import {
+  fetchDirectoryIndex,
+  fetchSingleDaySummary,
+  fetchOverviewHtml,
+} from './lib/foodDataFetcher';
+import { FoodDataState, FoodLogEntry } from './types/foodLog';
+import { RefreshCw, AlertTriangle } from 'lucide-react';
 
 export default function App() {
-  const [inputDir, setInputDir] = useState('./data');
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ success?: boolean; message?: string; error?: string } | null>(null);
+  const [dataState, setDataState] = useState<FoodDataState>({
+    overviewMarkdown: '',
+    overviewHtml: '',
+    dates: [],
+    entriesByDate: {},
+    allFiles: [],
+    lastFetched: new Date(),
+    indexLoaded: false,
+    overviewLoaded: false,
+    loadedDaysCount: 0,
+    statsReady: false,
+    loading: true,
+    error: null,
+  });
 
-  const handleGenerate = async () => {
-    setLoading(true);
-    setResult(null);
-    try {
-      const response = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ inputDir }),
+  const [activeTab, setActiveTab] = useState<'overview' | 'foodlog' | 'analytics' | 'groceries'>('foodlog');
+
+  const [modalDoc, setModalDoc] = useState<{
+    url: string;
+    title: string;
+    type: 'pdf' | 'image';
+  } | null>(null);
+
+  // Cancellation token for streaming queue
+  const loadSequenceIdRef = useRef(0);
+
+  const startProgressiveLoad = useCallback(async () => {
+    const currentSequenceId = ++loadSequenceIdRef.current;
+
+    setDataState((prev) => ({
+      ...prev,
+      loading: true,
+      error: null,
+      loadedDaysCount: 0,
+      statsReady: false,
+    }));
+
+    // Step 1: Always load overview.md asynchronously directly
+    fetchOverviewHtml()
+      .then((ov) => {
+        if (loadSequenceIdRef.current !== currentSequenceId) return;
+        setDataState((prev) => ({
+          ...prev,
+          overviewMarkdown: ov.markdown,
+          overviewHtml: ov.html,
+          overviewLoaded: true,
+        }));
+      })
+      .catch((err) => {
+        console.warn('Overview load error:', err);
+        if (loadSequenceIdRef.current === currentSequenceId) {
+          setDataState((prev) => ({
+            ...prev,
+            overviewHtml: '<p className="text-slate-500 italic">Unable to load theory overview.</p>',
+            overviewLoaded: true,
+          }));
+        }
       });
-      const data = await response.json();
-      if (response.ok) {
-        setResult({ success: true, message: data.message });
-      } else {
-        setResult({ success: false, error: data.error });
+
+    try {
+      // Step 2: Get directory index & file pointers
+      const index = await fetchDirectoryIndex();
+      if (loadSequenceIdRef.current !== currentSequenceId) return;
+
+      const dates = index.sortedDates;
+      const initialLoadedCount = index.loadedDaysCount || 0;
+      const targetStats = Math.min(30, dates.length);
+      const isStatsReady = initialLoadedCount >= targetStats;
+
+      setDataState((prev) => ({
+        ...prev,
+        dates: index.sortedDates,
+        entriesByDate: index.initialEntries,
+        allFiles: index.allFiles,
+        lastFetched: new Date(),
+        indexLoaded: true,
+        loadedDaysCount: initialLoadedCount,
+        statsReady: isStatsReady,
+        loading: false,
+        error: null,
+        ...(index.overviewHtml ? {
+          overviewMarkdown: index.overviewMarkdown || prev.overviewMarkdown,
+          overviewHtml: index.overviewHtml,
+          overviewLoaded: true,
+        } : {}),
+      }));
+
+      // Check if any dates still need summary loading
+      const pendingDates = dates.filter((d) => !index.initialEntries[d]?.summaryLoaded);
+
+      if (pendingDates.length === 0) {
+        return;
+      }
+
+      // Stream pending summaries in chunks
+      const chunkSize = 5;
+      for (let i = 0; i < pendingDates.length; i += chunkSize) {
+        if (loadSequenceIdRef.current !== currentSequenceId) return;
+
+        const chunk = pendingDates.slice(i, i + chunkSize);
+        const chunkPromises = chunk.map(async (date) => {
+          const initialEntry = index.initialEntries[date];
+          if (!initialEntry) return;
+
+          const updated = await fetchSingleDaySummary(initialEntry);
+
+          if (loadSequenceIdRef.current !== currentSequenceId) return;
+
+          setDataState((prev) => {
+            const nextEntries = { ...prev.entriesByDate, [date]: updated };
+            const nextCount = Object.values(nextEntries).filter((e: FoodLogEntry) => e.summaryLoaded).length;
+            const isReady = nextCount >= targetStats;
+
+            return {
+              ...prev,
+              entriesByDate: nextEntries,
+              loadedDaysCount: nextCount,
+              statsReady: isReady,
+            };
+          });
+        });
+
+        await Promise.allSettled(chunkPromises);
       }
     } catch (err: any) {
-      setResult({ success: false, error: err.message });
+      console.error('Error during progressive load:', err);
+      if (loadSequenceIdRef.current === currentSequenceId) {
+        setDataState((prev) => ({
+          ...prev,
+          loading: false,
+          error: err.message || 'Unable to connect to cloud storage.',
+        }));
+      }
     }
-    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    startProgressiveLoad();
+  }, [startProgressiveLoad]);
+
+  const handleOpenDoc = (url: string, title: string, type: 'pdf' | 'image') => {
+    setModalDoc({ url, title, type });
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 p-8 font-sans">
-      <div className="max-w-4xl mx-auto space-y-8">
-        <header className="text-center space-y-2">
-          <div className="mx-auto w-16 h-16 bg-blue-100 text-blue-600 rounded-2xl flex items-center justify-center mb-4 shadow-sm">
-            <FileBox className="w-8 h-8" />
-          </div>
-          <h1 className="text-4xl font-bold tracking-tight">Static Site Generator</h1>
-          <p className="text-slate-500">Transform your diet & grocery documents into a static website.</p>
-        </header>
+    <div className="min-h-screen bg-[#FAFAFA] text-[#111111] flex flex-col font-sans selection:bg-blue-600 selection:text-white">
+      {/* Header Bar */}
+      <Header
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+      />
 
-        <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-          <div className="space-y-4">
-            <div>
-              <label htmlFor="inputDir" className="block text-sm font-medium text-slate-700 mb-1">
-                Input Directory Path
-              </label>
-              <input
-                id="inputDir"
-                type="text"
-                value={inputDir}
-                onChange={(e) => setInputDir(e.target.value)}
-                className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
-                placeholder="./data"
-              />
-              <p className="text-xs text-slate-500 mt-2">
-                Path relative to the project root where your markdown and PDF files are located.
-              </p>
+      {/* Main Container */}
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 md:px-8 py-8">
+        {dataState.loading && !dataState.indexLoaded ? (
+          <div className="bg-white p-12 md:p-16 rounded-2xl border border-slate-200 shadow-sm text-center space-y-4">
+            <div className="w-12 h-12 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center mx-auto animate-pulse">
+              <RefreshCw className="w-6 h-6 animate-spin" />
             </div>
-
+            <h3 className="text-xl font-extrabold text-slate-900">Discovering Cloud Log Index...</h3>
+            <p className="text-slate-500 text-sm max-w-md mx-auto">
+              Connecting to cloud storage to index all available food logs and documents.
+            </p>
+          </div>
+        ) : dataState.error ? (
+          <div className="bg-red-50 p-8 rounded-2xl border border-red-200 text-red-900 space-y-4">
+            <div className="flex items-center gap-3">
+              <AlertTriangle className="w-6 h-6 text-red-600 shrink-0" />
+              <h3 className="font-extrabold text-lg">Unable to connect to cloud storage</h3>
+            </div>
+            <p className="text-sm opacity-90">{dataState.error}</p>
             <button
-              onClick={handleGenerate}
-              disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-xl flex items-center justify-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              onClick={startProgressiveLoad}
+              className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl transition-colors"
             >
-              {loading ? (
-                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              ) : (
-                <Play className="w-5 h-5" />
-              )}
-              {loading ? 'Generating...' : 'Generate Site'}
+              Retry Connection
             </button>
           </div>
+        ) : (
+          <>
+            {activeTab === 'foodlog' && (
+              <FoodLogSection
+                dates={dataState.dates}
+                entriesByDate={dataState.entriesByDate}
+                onOpenDoc={handleOpenDoc}
+              />
+            )}
 
-          {result && (
-            <div className={`mt-4 p-4 rounded-xl flex items-start gap-3 ${result.success ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-              {result.success ? <CheckCircle className="w-5 h-5 shrink-0 mt-0.5" /> : <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />}
-              <div>
-                <h4 className="font-semibold">{result.success ? 'Success!' : 'Error generating site'}</h4>
-                <p className="text-sm mt-1 opacity-90">{result.success ? result.message : result.error}</p>
-                {result.success && (
-                  <a
-                    href="/preview"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-block mt-3 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-lg transition-colors"
-                  >
-                    View Generated Site
-                  </a>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-        
-        {result?.success && (
-          <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col" style={{ height: '600px' }}>
-            <div className="bg-slate-100 border-b border-slate-200 px-4 py-3 flex items-center justify-between">
-              <h3 className="font-medium text-slate-700 text-sm">Preview window (index.html)</h3>
-              <div className="flex gap-1.5">
-                <div className="w-3 h-3 rounded-full bg-slate-300"></div>
-                <div className="w-3 h-3 rounded-full bg-slate-300"></div>
-                <div className="w-3 h-3 rounded-full bg-slate-300"></div>
-              </div>
-            </div>
-            <iframe src="/preview" className="w-full flex-1 border-0 bg-white" title="Generated Site Preview"></iframe>
-          </section>
+            {activeTab === 'overview' && (
+              <OverviewSection overviewHtml={dataState.overviewHtml} />
+            )}
+
+            {activeTab === 'analytics' && (
+              <AnalyticsSection
+                dates={dataState.dates}
+                entriesByDate={dataState.entriesByDate}
+                loadedDaysCount={dataState.loadedDaysCount}
+                statsReady={dataState.statsReady}
+              />
+            )}
+
+            {activeTab === 'groceries' && (
+              <GroceriesSection
+                dates={dataState.dates}
+                entriesByDate={dataState.entriesByDate}
+                onOpenDoc={handleOpenDoc}
+              />
+            )}
+          </>
         )}
-      </div>
+      </main>
+
+      {/* Document Modal */}
+      {modalDoc && (
+        <DocumentModal
+          url={modalDoc.url}
+          title={modalDoc.title}
+          type={modalDoc.type}
+          onClose={() => setModalDoc(null)}
+        />
+      )}
     </div>
   );
 }
