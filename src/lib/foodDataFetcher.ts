@@ -209,37 +209,15 @@ export async function fetchDirectoryIndex(): Promise<{
     console.log('No build-time data-manifest.json found, will try live fetch:', err);
   }
 
-  let htmlContent = '';
-
   if (cachedManifest && cachedManifest.allFiles && cachedManifest.sortedDates) {
-    cachedManifest.allFiles.forEach((f) => fileSet.add(f));
+    cachedManifest.allFiles.forEach((f) => {
+      if (f !== 'index.html' && f !== 'CNAME' && !f.endsWith('.svg')) {
+        fileSet.add(f);
+      }
+    });
     cachedManifest.sortedDates.forEach((d) => dateSet.add(d));
   } else {
-    // 2. Fallback to live fetching from remote cloud
-    try {
-      htmlContent = await fetchWithFallback(REMOTE_BASE_URL);
-    } catch (err) {
-      console.warn('Could not fetch directory listing:', err);
-    }
-
-    if (htmlContent) {
-      const fileRegex = /["'](?:[.\/]*)(202\d{5}[^"'\?#]+\.(?:pdf|html|htm|txt|png|jpg|jpeg))["']/gi;
-      let m: RegExpExecArray | null;
-      while ((m = fileRegex.exec(htmlContent)) !== null) {
-        const fn = decodeURIComponent(m[1]).replace(/^\.\//, '').trim();
-        if (fn !== 'index.html' && fn !== 'CNAME' && !fn.endsWith('.svg')) {
-          fileSet.add(fn);
-          const dm = fn.match(/^(202\d{5})/);
-          if (dm) dateSet.add(dm[1]);
-        }
-      }
-
-      const dateRegex = /\b(202\d{5})\b/g;
-      let mDate: RegExpExecArray | null;
-      while ((mDate = dateRegex.exec(htmlContent)) !== null) {
-        dateSet.add(mDate[1]);
-      }
-    }
+    console.warn('No data-manifest.json available.');
   }
 
   // Ensure every discovered date has its standard summary file
@@ -247,8 +225,8 @@ export async function fetchDirectoryIndex(): Promise<{
     fileSet.add(`${date} summary.txt`);
   });
 
-  const allFiles = Array.from(fileSet);
-  const hasOverview = cachedManifest?.hasOverview || htmlContent.toLowerCase().includes('overview.md') || true;
+  const allFiles = Array.from(fileSet).filter((f) => f !== 'index.html' && f !== 'CNAME');
+  const hasOverview = cachedManifest?.hasOverview || true;
   const sortedDates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
 
   // Build initial entries for each date

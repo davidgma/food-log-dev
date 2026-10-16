@@ -4,53 +4,126 @@ import { fileURLToPath } from 'url';
 
 const REMOTE_BASE_URL = 'https://filedn.com/l8l3tmJlFBQbibudQ3R2XYu/food-data/';
 
+// Expected file suffixes for food log data
+const CANDIDATE_SUFFIXES = [
+  'summary.txt',
+  'detail.pdf',
+  'groceries o.pdf',
+  'groceries w.pdf',
+  'groceries w.html',
+  'groceries w - converted.html',
+  'nutrition.pdf',
+  'groceries f.png',
+  'groceries f.jpg',
+  'food.png',
+  'food.jpg',
+  'food.jpeg',
+];
+
 async function buildManifest() {
-  console.log('Fetching directory index from pCloud:', REMOTE_BASE_URL);
-  
+  console.log('Building food log data manifest from pCloud data files...');
+
   const fileSet = new Set();
   const dateSet = new Set();
-  let htmlContent = '';
 
-  try {
-    const res = await fetch(REMOTE_BASE_URL);
-    if (res.ok) {
-      htmlContent = await res.text();
-    }
-  } catch (err) {
-    console.error('Failed to fetch pCloud root directory:', err);
-  }
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const publicDir = path.join(__dirname, '..', 'public');
+  const manifestPath = path.join(publicDir, 'data-manifest.json');
 
-  if (htmlContent) {
-    // Extract filenames from quotes, hrefs, src
-    const fileRegex = /["'](?:[.\/]*)(202\d{5}[^"'\?#]+\.(?:pdf|html|htm|txt|png|jpg|jpeg))["']/gi;
-    let m;
-    while ((m = fileRegex.exec(htmlContent)) !== null) {
-      const fn = decodeURIComponent(m[1]).replace(/^\.\//, '').trim();
-      if (fn !== 'index.html' && fn !== 'CNAME' && !fn.endsWith('.svg')) {
-        fileSet.add(fn);
-        const dm = fn.match(/^(202\d{5})/);
-        if (dm) dateSet.add(dm[1]);
+  // 1. Seed from existing data-manifest.json if available
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const existingManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (Array.isArray(existingManifest.sortedDates)) {
+        existingManifest.sortedDates.forEach((d) => dateSet.add(d));
       }
-    }
-
-    // Match all 8-digit date strings YYYYMMDD
-    const dateRegex = /\b(202\d{5})\b/g;
-    while ((m = dateRegex.exec(htmlContent)) !== null) {
-      dateSet.add(m[1]);
+      if (Array.isArray(existingManifest.allFiles)) {
+        existingManifest.allFiles.forEach((f) => {
+          // Filter out index.html, CNAME, or unexpected non-data files
+          if (f !== 'index.html' && f !== 'CNAME' && !f.endsWith('.svg')) {
+            fileSet.add(f);
+          }
+        });
+      }
+      console.log(`Loaded ${dateSet.size} seed dates and ${fileSet.size} seed files from existing manifest.`);
+    } catch (err) {
+      console.warn('Could not read existing data-manifest.json seed:', err);
     }
   }
 
-  // Ensure summary file for each date is included
+  // 2. Generate candidate date list (past 180 days up to +3 days in future, plus any known seed dates)
+  const candidateDates = Array.from(dateSet);
+  const today = new Date();
+
+  for (let i = 3; i >= -180; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + i);
+    const yyyymmdd =
+      d.getFullYear().toString() +
+      String(d.getMonth() + 1).padStart(2, '0') +
+      String(d.getDate()).padStart(2, '0');
+    if (!candidateDates.includes(yyyymmdd)) {
+      candidateDates.push(yyyymmdd);
+    }
+  }
+
+  // Sort candidate dates descending
+  candidateDates.sort((a, b) => b.localeCompare(a));
+
+  console.log(`Probing pCloud for data files across ${candidateDates.length} candidate dates...`);
+
+  // 3. Batched probing of candidate dates for expected data files
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < candidateDates.length; i += BATCH_SIZE) {
+    const batch = candidateDates.slice(i, i + BATCH_SIZE);
+    await Promise.all(
+      batch.map(async (date) => {
+        const summaryFn = `${date} summary.txt`;
+        let hasSummary = fileSet.has(summaryFn);
+
+        if (!hasSummary) {
+          try {
+            const res = await fetch(REMOTE_BASE_URL + encodeURIComponent(summaryFn), { method: 'GET' });
+            if (res.ok) {
+              hasSummary = true;
+              fileSet.add(summaryFn);
+              dateSet.add(date);
+            }
+          } catch (e) {}
+        }
+
+        if (hasSummary || dateSet.has(date)) {
+          await Promise.all(
+            CANDIDATE_SUFFIXES.map(async (suffix) => {
+              const fn = `${date} ${suffix}`;
+              if (fileSet.has(fn)) return;
+              try {
+                const res = await fetch(REMOTE_BASE_URL + encodeURIComponent(fn), { method: 'GET' });
+                if (res.ok) {
+                  fileSet.add(fn);
+                  dateSet.add(date);
+                }
+              } catch (e) {}
+            })
+          );
+        }
+      })
+    );
+  }
+
+  // Ensure every valid date has summary file name registered
   dateSet.forEach((date) => {
     fileSet.add(`${date} summary.txt`);
   });
 
   const sortedDates = Array.from(dateSet).sort((a, b) => b.localeCompare(a));
-  const allFiles = Array.from(fileSet);
+  const allFiles = Array.from(fileSet).filter((f) => f !== 'index.html' && f !== 'CNAME');
 
-  console.log(`Found ${sortedDates.length} dates and ${allFiles.length} files.`);
+  console.log(`Probing completed: ${sortedDates.length} dates and ${allFiles.length} files found.`);
+  console.log('Latest 5 dates:', sortedDates.slice(0, 5));
 
-  // Fetch overview.md
+  // 4. Fetch overview.md
   let overviewMarkdown = '# The Theory\nNo theory overview found.';
   try {
     const ovRes = await fetch(REMOTE_BASE_URL + 'overview.md');
@@ -61,9 +134,7 @@ async function buildManifest() {
         if (commaIdx !== -1) {
           try {
             overviewMarkdown = Buffer.from(overviewMarkdown.substring(commaIdx + 1), 'base64').toString('utf-8');
-          } catch (e) {
-            console.warn('Failed to decode base64 overviewMarkdown:', e);
-          }
+          } catch (e) {}
         }
       }
       console.log('Successfully fetched overview.md (length:', overviewMarkdown.length, ')');
@@ -72,10 +143,10 @@ async function buildManifest() {
     console.warn('Could not fetch overview.md:', err);
   }
 
-  // Fetch all summary texts in parallel/batches
+  // 5. Fetch all summary texts
   const summaries = {};
   console.log('Fetching summary text files for each date...');
-  
+
   const fetchTasks = sortedDates.map(async (date) => {
     const summaryFileName = `${date} summary.txt`;
     const summaryUrl = REMOTE_BASE_URL + encodeURIComponent(summaryFileName);
@@ -95,9 +166,7 @@ async function buildManifest() {
           summaries[date] = text;
         }
       }
-    } catch (err) {
-      // Ignore individual failures
-    }
+    } catch (err) {}
   });
 
   await Promise.all(fetchTasks);
@@ -113,15 +182,10 @@ async function buildManifest() {
     summaries,
   };
 
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  const publicDir = path.join(__dirname, '..', 'public');
-
   if (!fs.existsSync(publicDir)) {
     fs.mkdirSync(publicDir, { recursive: true });
   }
 
-  const manifestPath = path.join(publicDir, 'data-manifest.json');
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
   console.log(`Wrote manifest to ${manifestPath} (${(fs.statSync(manifestPath).size / 1024).toFixed(1)} KB)`);
 }
